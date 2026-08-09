@@ -11,11 +11,11 @@ jobs:
           distribution: 'zulu'
           java-version: '17'
 
-      # هذا السطر ينشئ ملف settings.gradle وكل الملفات الناقصة تلقائياً
       - name: Initialize Gradle Environment
         run: |
           echo "include ':app'" > settings.gradle
-          gradle wrapper --gradle-version 8.4
+          gradle wrapper --gradle-version 8.7
+          chmod +x gradlew
 
       - name: Build with Gradle
         run: ./gradlew assembleDebug
