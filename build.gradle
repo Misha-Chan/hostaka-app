@@ -1,16 +1,9 @@
-plugins {
-    id 'com.android.application'
-}
-
-android {
-    namespace 'com.hostaka.app'
-    compileSdk 34
-
-    defaultConfig {
-        applicationId "com.hostaka.app"
-        minSdk 24
-        targetSdk 34
-        versionCode 1
-        versionName "1.0"
+buildscript {
+    repositories {
+        google()
+        mavenCentral()
+    }
+    dependencies {
+        classpath 'com.android.tools.build:gradle:8.4.0'
     }
 }
