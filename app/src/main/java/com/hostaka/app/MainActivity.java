@@ -1,11 +1,18 @@
 package com.hostaka.app;
 
+import android.Manifest;
 import android.annotation.SuppressLint;
+import android.content.Intent;
+import android.content.pm.PackageManager;
 import android.net.ConnectivityManager;
 import android.net.NetworkInfo;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
+import android.provider.MediaStore;
 import android.view.View;
+import android.webkit.ValueCallback;
+import android.webkit.WebChromeClient;
 import android.webkit.WebResourceError;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebSettings;
@@ -15,8 +22,20 @@ import android.widget.Button;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
 
-import androidx.appcompat.app.AppCompatActivity;
 import androidx.activity.OnBackPressedCallback;
+import androidx.activity.result.ActivityResultLauncher;
+import androidx.activity.result.contract.ActivityResultContracts;
+import androidx.appcompat.app.AppCompatActivity;
+import androidx.core.content.ContextCompat;
+import androidx.core.content.FileProvider;
+
+import java.io.File;
+import java.io.IOException;
+import java.text.SimpleDateFormat;
+import java.util.ArrayList;
+import java.util.Date;
+import java.util.List;
+import java.util.Locale;
 
 public class MainActivity extends AppCompatActivity {
 
@@ -25,6 +44,13 @@ public class MainActivity extends AppCompatActivity {
     private WebView webView;
     private ProgressBar progressBar;
     private LinearLayout offlineLayout;
+
+    // --- File upload (from <input type="file"> on the website) ---
+    private ValueCallback<Uri[]> filePathCallback;
+    private String cameraPhotoPath;
+    private ActivityResultLauncher<Intent> fileChooserLauncher;
+    private ActivityResultLauncher<String[]> mediaPermissionLauncher;
+    private Intent pendingChooserIntent;
 
     @SuppressLint("SetJavaScriptEnabled")
     @Override
@@ -37,11 +63,11 @@ public class MainActivity extends AppCompatActivity {
         offlineLayout = findViewById(R.id.offlineLayout);
         Button retryButton = findViewById(R.id.retryButton);
 
+        registerLaunchers();
         setupWebView();
 
         retryButton.setOnClickListener(v -> loadHome());
 
-        // Handle system back button: go back in WebView history first
         getOnBackPressedDispatcher().addCallback(this, new OnBackPressedCallback(true) {
             @Override
             public void handleOnBackPressed() {
@@ -61,6 +87,41 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
+    private void registerLaunchers() {
+        fileChooserLauncher = registerForActivityResult(
+                new ActivityResultContracts.StartActivityForResult(),
+                result -> {
+                    if (filePathCallback == null) return;
+
+                    Uri[] results = null;
+                    if (result.getResultCode() == RESULT_OK) {
+                        Intent data = result.getData();
+                        if (data != null && data.getClipData() != null) {
+                            int count = data.getClipData().getItemCount();
+                            results = new Uri[count];
+                            for (int i = 0; i < count; i++) {
+                                results[i] = data.getClipData().getItemAt(i).getUri();
+                            }
+                        } else if (data != null && data.getData() != null) {
+                            results = new Uri[]{data.getData()};
+                        } else if (cameraPhotoPath != null) {
+                            results = new Uri[]{Uri.parse(cameraPhotoPath)};
+                        }
+                    }
+                    filePathCallback.onReceiveValue(results);
+                    filePathCallback = null;
+                });
+
+        mediaPermissionLauncher = registerForActivityResult(
+                new ActivityResultContracts.RequestMultiplePermissions(),
+                permissions -> {
+                    if (pendingChooserIntent != null) {
+                        fileChooserLauncher.launch(pendingChooserIntent);
+                        pendingChooserIntent = null;
+                    }
+                });
+    }
+
     private void setupWebView() {
         WebSettings settings = webView.getSettings();
         settings.setJavaScriptEnabled(true);
@@ -72,16 +133,11 @@ public class MainActivity extends AppCompatActivity {
         settings.setBuiltInZoomControls(false);
         settings.setCacheMode(WebSettings.LOAD_DEFAULT);
         settings.setMediaPlaybackRequiresUserGesture(false);
+        settings.setAllowFileAccess(true);
 
         webView.setWebViewClient(new WebViewClient() {
             @Override
             public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
-                String url = request.getUrl().toString();
-                // Keep navigation for our own domain inside the app
-                if (Uri.parse(url).getHost() != null && Uri.parse(url).getHost().contains("hostaka.fun")) {
-                    return false;
-                }
-                // Let the system handle external links (mail, tel, other domains, etc.)
                 return false;
             }
 
@@ -106,7 +162,7 @@ public class MainActivity extends AppCompatActivity {
             }
         });
 
-        webView.setWebChromeClient(new android.webkit.WebChromeClient() {
+        webView.setWebChromeClient(new WebChromeClient() {
             @Override
             public void onProgressChanged(WebView view, int newProgress) {
                 super.onProgressChanged(view, newProgress);
@@ -115,7 +171,98 @@ public class MainActivity extends AppCompatActivity {
                     progressBar.setVisibility(View.GONE);
                 }
             }
+
+            @Override
+            public boolean onShowFileChooser(WebView view, ValueCallback<Uri[]> callback,
+                                              FileChooserParams fileChooserParams) {
+                if (filePathCallback != null) {
+                    filePathCallback.onReceiveValue(null);
+                }
+                filePathCallback = callback;
+
+                Intent chooserIntent = buildChooserIntent(fileChooserParams);
+                requestMediaPermissionsThenLaunch(chooserIntent);
+                return true;
+            }
         });
+    }
+
+    private Intent buildChooserIntent(WebChromeClient.FileChooserParams fileChooserParams) {
+        String[] acceptTypes = fileChooserParams.getAcceptTypes();
+        String mimeType = "*/*";
+        if (acceptTypes != null && acceptTypes.length > 0 && !acceptTypes[0].isEmpty()) {
+            mimeType = acceptTypes[0];
+        }
+
+        boolean allowMultiple = fileChooserParams.getMode() == WebChromeClient.FileChooserParams.MODE_OPEN_MULTIPLE;
+
+        Intent contentSelectionIntent = new Intent(Intent.ACTION_GET_CONTENT);
+        contentSelectionIntent.addCategory(Intent.CATEGORY_OPENABLE);
+        contentSelectionIntent.setType(mimeType);
+        if (allowMultiple) {
+            contentSelectionIntent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
+        }
+
+        List<Intent> intentList = new ArrayList<>();
+
+        boolean wantsImage = mimeType.contains("image") || mimeType.equals("*/*");
+        if (wantsImage && getPackageManager().hasSystemFeature(PackageManager.FEATURE_CAMERA_ANY)) {
+            Intent cameraIntent = new Intent(MediaStore.ACTION_IMAGE_CAPTURE);
+            File photoFile = createImageFile();
+            if (photoFile != null) {
+                cameraPhotoPath = Uri.fromFile(photoFile).toString();
+                Uri photoUri = FileProvider.getUriForFile(this,
+                        "com.hostaka.app.fileprovider", photoFile);
+                cameraIntent.putExtra(MediaStore.EXTRA_OUTPUT, photoUri);
+                cameraIntent.addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+                intentList.add(cameraIntent);
+            }
+        }
+
+        Intent chooserIntent = Intent.createChooser(contentSelectionIntent, "اختر ملف");
+        if (!intentList.isEmpty()) {
+            chooserIntent.putExtra(Intent.EXTRA_INITIAL_INTENTS, intentList.toArray(new Intent[0]));
+        }
+        return chooserIntent;
+    }
+
+    private File createImageFile() {
+        try {
+            String timeStamp = new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date());
+            File storageDir = getExternalCacheDir();
+            File imagesDir = new File(storageDir, "images");
+            if (!imagesDir.exists()) {
+                imagesDir.mkdirs();
+            }
+            return File.createTempFile("HOSTAKA_" + timeStamp, ".jpg", imagesDir);
+        } catch (IOException e) {
+            return null;
+        }
+    }
+
+    private void requestMediaPermissionsThenLaunch(Intent chooserIntent) {
+        List<String> needed = new ArrayList<>();
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            addIfNotGranted(needed, Manifest.permission.READ_MEDIA_IMAGES);
+            addIfNotGranted(needed, Manifest.permission.READ_MEDIA_VIDEO);
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            addIfNotGranted(needed, Manifest.permission.READ_EXTERNAL_STORAGE);
+        }
+        addIfNotGranted(needed, Manifest.permission.CAMERA);
+
+        if (needed.isEmpty()) {
+            fileChooserLauncher.launch(chooserIntent);
+        } else {
+            pendingChooserIntent = chooserIntent;
+            mediaPermissionLauncher.launch(needed.toArray(new String[0]));
+        }
+    }
+
+    private void addIfNotGranted(List<String> list, String permission) {
+        if (ContextCompat.checkSelfPermission(this, permission) != PackageManager.PERMISSION_GRANTED) {
+            list.add(permission);
+        }
     }
 
     private void loadHome() {
